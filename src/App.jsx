@@ -24,15 +24,17 @@ export default function App() {
   const generateRoomCode = () =>
     Math.floor(1000 + Math.random() * 9000).toString();
 
+  // Create Room
   const createRoom = async () => {
     if (!nickname.trim()) return alert("Enter your nickname!");
     const code = generateRoomCode();
     setRoomCode(code);
 
-    const roomRef = ref(db, `rooms/${code}`);
-    await set(roomRef, {
+    await set(ref(db, `rooms/${code}`), {
       pot: 10,
-      players: { [nickname]: { coins: 10 } },
+      players: {
+        [nickname]: { coins: 10, lastChance: false },
+      },
       turn: nickname,
     });
 
@@ -40,36 +42,37 @@ export default function App() {
     setPlayerName(nickname);
   };
 
+  // Join Room
   const joinRoom = async () => {
-    if (!roomCode.trim() || !nickname.trim())
-      return alert("Enter both nickname and room code!");
+    if (!roomCode || !nickname) return alert("Enter nickname & room code");
 
     const roomRef = ref(db, `rooms/${roomCode}`);
-    const snapshot = await get(roomRef);
+    const snap = await get(roomRef);
+    if (!snap.exists()) return alert("Room not found");
 
-    if (!snapshot.exists()) return alert("Room not found!");
+    const data = snap.val();
+    if (data.players?.[nickname])
+      return alert("Nickname already taken");
 
-    const roomData = snapshot.val();
-    if (roomData.players?.[nickname])
-      return alert("Nickname already taken!");
-
-    await update(roomRef, { [`players/${nickname}`]: { coins: 10 } });
+    await update(roomRef, {
+      [`players/${nickname}`]: { coins: 10, lastChance: false },
+    });
 
     setJoined(true);
     setPlayerName(nickname);
   };
 
+  // Listen to room updates
   useEffect(() => {
     if (!roomCode) return;
 
-    const roomRef = ref(db, `rooms/${roomCode}`);
-    return onValue(roomRef, (snapshot) => {
-      const data = snapshot.val();
+    const unsub = onValue(ref(db, `rooms/${roomCode}`), (snap) => {
+      const data = snap.val();
       if (!data) return;
 
-      setPot(data.pot || 0);
+      setPot(data.pot);
       setPlayers(data.players || {});
-      setTurn(data.turn || "");
+      setTurn(data.turn);
       setLastSpin(data.lastSpin || null);
 
       if (data.lastSpin?.letter === "Gimel") {
@@ -77,33 +80,54 @@ export default function App() {
         setTimeout(() => setShowConfetti(false), 3000);
       }
     });
+
+    return () => unsub();
   }, [roomCode]);
 
+  // Spin Dreidel
   const spinDreidel = async () => {
     if (turn !== playerName) return alert("Not your turn!");
     setSpinning(true);
 
     const result = sides[Math.floor(Math.random() * sides.length)];
-    setRotation((prev) => prev + 720 + Math.random() * 360);
+    setRotation((r) => r + 720 + Math.random() * 360);
 
     setTimeout(async () => {
       setSpinning(false);
 
       const roomRef = ref(db, `rooms/${roomCode}`);
-      const snapshot = await get(roomRef);
-      const data = snapshot.val();
-      if (!data) return;
+      const snap = await get(roomRef);
+      if (!snap.exists()) return;
 
-      let { pot, players } = data;
+      let { pot, players } = snap.val();
       const player = players[playerName];
+      const coinsBeforeSpin = player.coins;
       let resultMessage = "";
-
-      const playerNames = Object.keys(players);
 
       switch (result) {
         case "Nun":
           resultMessage = `${playerName} spun Nun – nothing happens.`;
           break;
+
+        case "Gimel": {
+          // Take pot
+          player.coins += pot;
+
+          // Leave 1 coin (counts as your ante)
+          player.coins -= 1;
+          pot = 1;
+
+          // Everyone else antes 1
+          Object.keys(players).forEach((name) => {
+            if (name !== playerName) {
+              players[name].coins -= 1;
+              pot += 1;
+            }
+          });
+
+          resultMessage = `${playerName} spun Gimel – takes the pot, everyone antes 1!`;
+          break;
+        }
 
         case "Hey": {
           const half = Math.floor(pot / 2);
@@ -118,33 +142,36 @@ export default function App() {
           pot += 1;
           resultMessage = `${playerName} spun Shin – adds 1 coin to the pot.`;
           break;
-
-        case "Gimel": {
-          const payout = Math.max(pot - 1, 0);
-          player.coins += payout;
-
-          // everyone puts in 1 coin (including winner)
-          playerNames.forEach((name) => {
-            players[name].coins -= 1;
-          });
-
-          pot = playerNames.length;
-          resultMessage = `${playerName} spun Gimel – takes ${payout} coins, everyone pays 1.`;
-          break;
-        }
       }
 
-      // zero-coin extra turn rule
-      let nextTurn = turn;
-      if (player.coins > 0) {
-        const idx = playerNames.indexOf(playerName);
-        nextTurn = playerNames[(idx + 1) % playerNames.length];
+      // Handle 0-coin last-chance rule
+      Object.keys(players).forEach((name) => {
+        const p = players[name];
+
+        if (p.coins === 0 && !p.lastChance) {
+          p.lastChance = true;
+        } else if (p.coins === 0 && p.lastChance) {
+          delete players[name];
+        } else if (p.coins > 0 && p.lastChance) {
+          p.lastChance = false;
+        }
+      });
+
+      const allPlayers = Object.keys(players);
+      const currentIndex = allPlayers.indexOf(playerName);
+
+      let nextPlayer =
+        allPlayers[(currentIndex + 1) % allPlayers.length];
+
+      // Extra turn ONLY if player had 0 and now has coins
+      if (coinsBeforeSpin === 0 && player.coins > 0) {
+        nextPlayer = playerName;
       }
 
       await update(roomRef, {
         pot,
         players,
-        turn: nextTurn,
+        turn: nextPlayer,
         lastSpin: {
           nickname: playerName,
           letter: result,
@@ -157,6 +184,7 @@ export default function App() {
     }, 1200);
   };
 
+  // Leave Room
   const leaveRoom = async () => {
     await remove(ref(db, `rooms/${roomCode}/players/${playerName}`));
     setJoined(false);
@@ -168,8 +196,54 @@ export default function App() {
   return (
     <div className="min-h-screen flex flex-col items-center justify-start bg-gradient-to-br from-blue-900 via-purple-700 to-pink-600 p-8 text-white font-sans">
       {showConfetti && <Confetti />}
-      {/* UI UNCHANGED BELOW */}
-      {/* … your existing JSX exactly as before … */}
+
+      <h1 className="text-5xl font-bold mb-6">🕎 Dreidel Multiplayer</h1>
+
+      {!joined ? (
+        <div className="bg-white/20 rounded-2xl p-8">
+          <input
+            placeholder="Nickname"
+            value={nickname}
+            onChange={(e) => setNickname(e.target.value)}
+          />
+          <button onClick={createRoom}>Create Room</button>
+          <input
+            placeholder="Room Code"
+            value={roomCode}
+            onChange={(e) => setRoomCode(e.target.value)}
+          />
+          <button onClick={joinRoom}>Join Room</button>
+        </div>
+      ) : (
+        <div className="bg-white/20 rounded-2xl p-6 w-full max-w-md">
+          <p>Room: {roomCode}</p>
+          <p>Turn: {turn}</p>
+          <p>Pot: {pot}</p>
+
+          <div
+            className="w-32 h-32 bg-white text-black flex items-center justify-center rounded-full"
+            style={{ rotate: `${rotation}deg` }}
+          >
+            {spinning ? "🎲" : lastSpin?.letter || "Spin"}
+          </div>
+
+          <button onClick={spinDreidel} disabled={spinning}>
+            Spin Dreidel
+          </button>
+
+          {lastSpin && <p>{lastSpin.message}</p>}
+
+          <h3>Players</h3>
+          {Object.entries(players).map(([n, d]) => (
+            <p key={n}>
+              {n}: {d.coins}
+            </p>
+          ))}
+
+          <button onClick={leaveRoom}>Leave</button>
+        </div>
+      )}
     </div>
   );
 }
+
